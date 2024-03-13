@@ -1,0 +1,165 @@
+Program.Sub.Preflight.Start
+Program.Sub.Preflight.End
+
+Program.Sub.Main.Start
+'BN, May 28, 2018
+'Company: Atec
+'Features:
+'When exit the screen Gross to Net Calculation (Program PR0023), this script will do the 401k calculation as following:
+	'Match 100% of the employees Contribution up to 1% of their earnings.
+	'Then Match 50% of the employees Contribution from 1% up to 6% of their earnings.  
+'Formula: Company Contribution = Min[EmpContr,Wages*0.01]*100% + if(EmpContr > Wages*0.01,  (Min[EmpContr,Wages*0.06]- Wages*0.01)*50%,   0)
+'EmpContr: Employee Contribution
+'Wages: 401k Wages
+
+f.Intrinsic.Control.Try
+	v.Local.sError.Declare
+	
+	'Exit hook of screen Gross to Net Calculation
+	'Payroll > Transactions > Pay Check Processing > Time Card Entry/Time Card Maintenance/Time Card Deduction Maintenance
+	f.Intrinsic.Control.If(v.Caller.Hook,=,34090)
+		F.odbc.Connection!conx.OpenCompanyConnection
+		f.Intrinsic.Control.CallSub("Process_401k_Calc")
+		F.odbc.Connection!conx.Close		
+	f.Intrinsic.Control.EndIf
+	
+F.Intrinsic.Control.Catch
+	Function.Intrinsic.String.Build("Subroutine Error {0}{0}Subroutine: {1}{0}Error Occurred {2} with description {3}",V.Ambient.Newline,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+	F.Intrinsic.UI.Msgbox(V.Local.sError)
+	f.Intrinsic.Control.CallSub("Unload")
+F.Intrinsic.Control.EndTry
+Program.Sub.Main.End
+
+Program.Sub.Process_401k_Calc.Start
+f.Intrinsic.Control.Try
+	v.Local.sError.Declare
+
+	'Delete all the Ineligible 401k Employees from the Payroll_401k match. Atec, Inc. setup: Eligible 401k employees are those who have the 401k % checkbox checked in the Employee Master screen
+	f.ODBC.Connection!conx.Execute("Delete from Payroll_401k where Employee in (Select Employee from V_Employee_Mstr where PR_401K_MATCH_PCT <> 'Y') and Flag_Update = ''")
+	'Get those who are Eligible. Wage_IRA is the 401k Wages
+	f.Data.DataTable.CreateFromSQL("D401","conx","Select p.DATE_MATCH,p.EMPLOYEE,p.SEQUENCE,p.PRMATCH_BLANK,p.EMPLOYEE_AMT,p.FLAG_UPDATE,p.CHECK_NUM,p.CHECK_CODE,p.VOID_FLG,p.WAGE_IRA,e.SOCIAL_SECURITY_NO,e.NAME,e.DEDUCT_7 from Payroll_401k p left join V_Employee_Mstr e on p.Employee = e.Employee where Flag_Update = '' and Wage_IRA > 0 Order by e.Name",True)	
+	'Calculate 1% amount and 6% amount of 401k Wages
+	f.Data.DataTable.AddExpressionColumn("D401","OnePct","Float","[WAGE_IRA]*0.01")
+	f.Data.DataTable.AddExpressionColumn("D401","SixPct","Float","[WAGE_IRA]*0.06")	
+	'Calculate bracket
+	f.Data.DataTable.AddExpressionColumn("D401","UpTo1PctContr","Float","IIF(EMPLOYEE_AMT > OnePct,OnePct,EMPLOYEE_AMT)")	
+	f.Data.DataTable.AddExpressionColumn("D401","MinEmpContrAndSixPct","Float","IIF(EMPLOYEE_AMT > SixPct,SixPct,Employee_AMT)")
+	f.Data.DataTable.AddExpressionColumn("D401","From1To6PctContr","Float","(MinEmpContrAndSixPct - OnePct)*0.5")	
+	f.Data.DataTable.AddExpressionColumn("D401","Company_AMT1","Float","IIF(EMPLOYEE_AMT > OnePct,UpTo1PctContr + From1To6PctContr,UpTo1PctContr)")
+	F.Data.DataTable.AddColumn("D401","Company_AMT","Float")	
+	'Format
+	F.Data.DataTable.SetValueFormat("D401",-1,"Company_AMT1","Company_AMT","#0.00")
+	'Save	
+	f.Data.DataTable.SaveToDB("D401","conx","Payroll_401k","DATE_MATCH*!*EMPLOYEE*!*SEQUENCE*!*PRMATCH_BLANK",256,"DATE_MATCH@!@DATE_MATCH*!*EMPLOYEE@!@EMPLOYEE*!*SEQUENCE@!@SEQUENCE*!*PRMATCH_BLANK@!@PRMATCH_BLANK*!*COMPANY_AMT@!@COMPANY_AMT*!*EMPLOYEE_AMT@!@EMPLOYEE_AMT*!*FLAG_UPDATE@!@FLAG_UPDATE*!*CHECK_NUM@!@CHECK_NUM*!*CHECK_CODE@!@CHECK_CODE*!*VOID_FLG@!@VOID_FLG*!*WAGE_IRA@!@WAGE_IRA")
+	'Export
+	f.Intrinsic.Control.If(v.DataTable.D401.RowCount,>,0)
+		f.Intrinsic.Control.CallSub("Export")
+	f.Intrinsic.Control.Else
+		f.Intrinsic.UI.Msgbox("No records found","Custom 401k Calculation")
+	f.Intrinsic.Control.EndIf	
+
+F.Intrinsic.Control.Catch
+	Function.Intrinsic.String.Build("Subroutine Error {0}{0}Subroutine: {1}{0}Error Occurred {2} with description {3}",V.Ambient.Newline,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+	F.Intrinsic.UI.Msgbox(V.Local.sError)
+	f.Intrinsic.Control.CallSub("Unload")
+F.Intrinsic.Control.EndTry
+Program.Sub.Process_401k_Calc.End
+
+Program.Sub.Export.Start
+'Export to csv file
+f.Intrinsic.Control.Try
+	v.Local..BulkDeclareString(sError,sHold,sLine,sFileList,sFileToWrite,sTotalEmpContr,sTotalCompanyContr,sTotalLoan,sLastName,sFirstName,sDate,sSocial,sEmpContr,sCompContr,sLoan)
+	v.Local..BulkDeclareLong(iCnt,iHndl)
+	v.Local.fHold.Declare
+	
+	'User will select the folder they want to save
+	F.Intrinsic.UI.ShowSaveFileDialog("","csv|*.csv",V.Local.sFileToWrite)
+	F.Intrinsic.Control.If(V.Local.sFileToWrite.IsCancel)
+		f.Intrinsic.Control.CallSub("Unload")
+	F.Intrinsic.Control.EndIf	
+	
+	f.Intrinsic.UI.InvokeWaitDialog("Exporting...")
+	
+	'Prepare to write Lines to csv file
+	F.Intrinsic.File.GetHandle(V.Local.iHndl)
+	F.Intrinsic.File.GetFileList(V.Local.sFileToWrite,V.Local.sFileList)
+	F.Intrinsic.Control.If(V.Local.sFileList,=,"")
+		F.Intrinsic.File.OpenForAppend(V.Local.sFileToWrite,V.Local.iHndl)
+	F.Intrinsic.Control.Else
+		F.Intrinsic.File.DeleteFile(V.Local.sFileToWrite)
+		F.Intrinsic.File.OpenForAppend(V.Local.sFileToWrite,V.Local.iHndl)
+	F.Intrinsic.Control.EndIf	
+
+	'Write Report Title
+	F.Intrinsic.File.WriteLine(V.Local.iHndl,"Contribution Processing Excel Spreadsheet")
+	F.Intrinsic.File.WriteLine(V.Local.iHndl,"PLAN NAME:,Atec")
+	F.Intrinsic.File.WriteLine(V.Local.iHndl,"CLIENT ID:,211290")
+	v.Local.sDate.Set(v.DataTable.D401(0).DATE_MATCH!FieldValTrim)
+	F.Intrinsic.String.Mid(V.Local.sDate,5,2,v.Local.sHold)
+	f.Intrinsic.String.Build("PAYROLL DATE:,{0}/{1}/{2}",v.Local.sHold,v.Local.sDate.Right2,v.Local.sDate.left4,v.Local.sLine)
+	F.Intrinsic.File.WriteLine(V.Local.iHndl,v.Local.sLine)
+	'Summary number
+	'Total Employee Contribution
+	f.Data.DataTable.Compute("D401","Sum([EMPLOYEE_AMT])","",v.Local.fHold)
+	f.Intrinsic.String.Format(v.Local.fHold,"#0.00",v.Local.sTotalEmpContr)
+	'Total Company Contribution
+	f.Data.DataTable.Compute("D401","Sum([COMPANY_AMT])","",v.Local.fHold)
+	f.Intrinsic.String.Format(v.Local.fHold,"#0.00",v.Local.sTotalCompanyContr)
+	'Total Loan
+	f.Data.DataTable.Compute("D401","Sum([DEDUCT_7])","",v.Local.fHold)
+	f.Intrinsic.String.Format(v.Local.fHold,"#0.00",v.Local.sTotalLoan)
+	'Write Summary number
+	f.Intrinsic.String.Build(",,,,TOTALS,,{0},,{1},,,{2}",v.Local.sTotalEmpContr,v.Local.sTotalLoan,v.Local.sTotalCompanyContr,v.Local.sLine)
+	F.Intrinsic.File.WriteLine(V.Local.iHndl,v.Local.sLine)	
+	'Write Column Title
+	F.Intrinsic.File.WriteLine(V.Local.iHndl,"SOCIAL SECURITY,LAST NAME,FIRST NAME,MI,DIVISIONAL CODE,TOTAL COMPENSATION,EMPLOYEE 401(K),ROTH 401(K),LOAN PAYMENT AMOUNT,MATCH,PROFIT SHARING,SAFE HARBOR MATCH,SAFE HARBOR NEC,CLIENT SPECIFIC,CLIENT SPECIFIC,CLIENT SPECIFIC,HOURS,ADDRESS 1,,CITY,STATE,ZIP,DATE OF BIRTH,DATE OF HIRE,EMPLOYEE ELIGIBILITY DATE,DATE OF TERM,PRIOR HIRE,PRIOR TERM")
+	'Write details data
+	f.Intrinsic.Control.For(v.Local.iCnt,0,v.DataTable.D401.RowCount--,1)
+		'Name
+		f.Intrinsic.String.Split(v.DataTable.D401(v.Local.iCnt).NAME!FieldValTrim,",",V.Local.sHold)
+		v.Local.sLastName.Set(v.Local.sHold(0).Trim)
+		f.Intrinsic.Control.If(v.Local.sHold.UBound,>,0)
+			v.Local.sFirstName.Set(v.Local.sHold(1).Trim)
+		f.Intrinsic.Control.EndIf
+		'Social Security
+		v.Local.sSocial.Set(v.DataTable.D401(v.Local.iCnt).SOCIAL_SECURITY_NO!FieldValTrim)
+		f.Intrinsic.String.Mid(v.Local.sSocial,4,2,v.Local.sHold)
+		f.Intrinsic.String.Build("{0}-{1}-{2}",v.Local.sSocial.left3,v.Local.sHold,v.Local.sSocial.Right4,v.Local.sSocial)
+		'Format Employee Contribution, Company Contribution, and Loan
+		f.Intrinsic.String.Format(v.DataTable.D401(v.Local.iCnt).Employee_AMT!FieldValFloat,"#0.00",v.Local.sEmpContr)
+		f.Intrinsic.String.Format(v.DataTable.D401(v.Local.iCnt).Company_AMT!FieldValFloat,"#0.00",v.Local.sCompContr)
+		f.Intrinsic.String.Format(v.DataTable.D401(v.Local.iCnt).Deduct_7!FieldValFloat,"#0.00",v.Local.sLoan)		
+		f.Intrinsic.String.Build("{0},{1},{2},,,,{3},,{4},,,{5}",v.Local.sSocial,v.Local.sLastName,v.Local.sFirstName,v.Local.sEmpContr,v.Local.sLoan,v.Local.sCompContr,v.Local.sLine)
+		F.Intrinsic.File.WriteLine(V.Local.iHndl,v.Local.sLine)		
+	f.Intrinsic.Control.Next(v.Local.iCnt)
+	
+	F.Intrinsic.File.CloseFile(V.Local.iHndl)
+	
+	f.Intrinsic.UI.CloseWaitDialog
+
+F.Intrinsic.Control.Catch
+	Function.Intrinsic.String.Build("Subroutine Error {0}{0}Subroutine: {1}{0}Error Occurred {2} with description {3}",V.Ambient.Newline,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+	F.Intrinsic.UI.Msgbox(V.Local.sError)
+	f.Intrinsic.Control.CallSub("Unload")
+F.Intrinsic.Control.EndTry
+Program.Sub.Export.End
+
+Program.Sub.Unload.Start
+f.Intrinsic.Control.Try
+	v.Local.sError.Declare
+
+	F.Intrinsic.Control.If(V.ODBC.conx.State,=,1)
+		F.ODBC.Connection!conx.close
+	F.Intrinsic.Control.EndIf
+	
+	f.Intrinsic.Control.End
+
+F.Intrinsic.Control.Catch
+	Function.Intrinsic.String.Build("Subroutine Error {0}{0}Subroutine: {1}{0}Error Occurred {2} with description {3}",V.Ambient.Newline,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+	F.Intrinsic.UI.Msgbox(V.Local.sError)
+	f.Intrinsic.Control.End
+F.Intrinsic.Control.EndTry
+Program.Sub.Unload.End
+
+
+
